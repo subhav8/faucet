@@ -64,6 +64,7 @@ def valve_factory(dp):
         'NoviFlow': Valve,
         'Open vSwitch': Valve,
         'ZodiacFX': Valve,
+        'OFDPA': OFDPA,
     }
 
     if dp.hardware in SUPPORTED_HARDWARE:
@@ -1010,8 +1011,16 @@ class Valve(object):
             eth_pkt = pkt.get_protocol(ethernet.ethernet)
             eth_src = eth_pkt.src
             eth_dst = eth_pkt.dst
-            vlan = self.dp.vlans[vlan_vid]
             port = self.dp.ports[in_port]
+
+            if vlan_vid is None:
+                vlan = self.dp.get_native_vlan(in_port)
+            else:
+                vlan = self.dp.vlans[vlan_vid]
+
+            if vlan is None:
+                self.logger.warning("Bad packet in")
+                return []
 
             if mac_addr_is_unicast(eth_src):
                 self.logger.debug(
@@ -1169,4 +1178,146 @@ class ArubaValve(Valve):
         ofmsgs = [parser.OFPTableFeaturesStatsRequest(
             datapath=None,
             body=ryu_table_loader.ryu_tables)]
+        return ofmsgs
+
+
+class OFDPA(Valve):
+    BRIDGING = 50
+    VLAN = 10
+    ACL = 60
+    TERMINATION_MAC = 20
+    counter = 0
+    last_installed = {}
+
+    def build_vlan_groups(self, vlan):
+        of_msgs = []
+        group_ids = []
+
+        for port in vlan.tagged:
+            # Create a L2 interface, for tagged we don't pop vlan
+            group_id = vlan.vid << 16
+            group_id += port.number
+            group_ids.append(group_id)
+            bkt = [parser.OFPBucket(actions=[parser.OFPActionOutput(port.number)])]
+            msg = parser.OFPGroupMod(None, ofp.OFPFC_ADD, ofp.OFPGT_INDIRECT,
+                                     group_id, bkt)
+            of_msgs.append(msg)
+
+        for port in vlan.untagged:
+            # Create a L2 interface, for tagged we don't pop vlan
+            group_id = vlan.vid << 16
+            group_id += port.number
+            group_ids.append(group_id)
+            bkt = [parser.OFPBucket(actions=[parser.OFPActionPopVlan(),
+                   parser.OFPActionOutput(port.number)])]
+            msg = parser.OFPGroupMod(None, ofp.OFPFC_ADD, ofp.OFPGT_INDIRECT,
+                                     group_id, bkt)
+            of_msgs.append(msg)
+
+        of_msgs.append(parser.OFPBarrierRequest(None))
+
+        # Make the VLAN broadcast group
+        group_id = (4<<28) + (vlan.vid<<16) + 1
+        bkt = [parser.OFPBucket(actions=[parser.OFPActionGroup(x)]) for x in group_ids]
+        msg = parser.OFPGroupMod(None, ofp.OFPFC_ADD, ofp.OFPGT_ALL,
+                                 group_id, bkt)
+        of_msgs.append(msg)
+
+        return group_id, of_msgs
+
+    @staticmethod
+    def write_actions(actions):
+        return parser.OFPInstructionActions(ofp.OFPIT_WRITE_ACTIONS, actions)
+
+    def build_flood_rules(self, vlan, modify=False):
+        """Add a flow to flood packets to unknown destinations on a VLAN."""
+
+        group_id, of_msgs = self.build_vlan_groups(vlan)
+        # TODO: Handle vlan.unicast_flood
+        match = parser.OFPMatch(vlan_vid=vlan.vid|ofp.OFPVID_PRESENT)
+        actions = [parser.OFPActionGroup(group_id)]
+        inst = [self.write_actions(actions), self.goto_table(self.ACL)]
+        msg = parser.OFPFlowMod(None, table_id=self.BRIDGING, priority=2,
+                                match=match, instructions=inst)
+        of_msgs.append(msg)
+
+        # Allow the vlan on each port
+        for port in vlan.tagged + vlan.untagged:
+            match = parser.OFPMatch(in_port=port.number, vlan_vid=vlan.vid|ofp.OFPVID_PRESENT)
+            inst = [self.goto_table(self.TERMINATION_MAC)]
+            msg = parser.OFPFlowMod(None, table_id=self.VLAN, priority=3,
+                                    match=match, instructions=inst)
+            of_msgs.append(msg)
+
+        of_msgs.append(parser.OFPBarrierRequest(None))
+
+        # Push a vlan onto those untagged ports
+        for port in vlan.untagged:
+            match = parser.OFPMatch(in_port=port.number, vlan_vid=0)
+            actions = [parser.OFPActionSetField(vlan_vid=vlan.vid)]
+            inst = [self.goto_table(self.TERMINATION_MAC), self.apply_actions(actions)]
+            msg = parser.OFPFlowMod(None, table_id=self.VLAN, priority=3,
+                                    match=match, instructions=inst)
+            of_msgs.append(msg)
+
+        return of_msgs
+
+    def learn_host_on_vlan_port(self, port, vlan, eth_src):
+        key = (vlan.vid, eth_src, port.number)
+        time_ = time.time()
+
+        if key in self.last_installed:
+            last_time = self.last_installed[key]
+            if last_time + 5 <= time_:
+                pass
+            else:
+                self.counter += 1
+                return []
+
+        self.last_installed[key] = time_
+        self.counter += 1
+        of_msgs = []
+
+        if port.permanent_learn:
+            learn_timeout = 0
+        else:
+            learn_timeout = self.dp.timeout
+            of_msgs.extend(self.delete_host_from_vlan(eth_src, vlan))
+
+        match = parser.OFPMatch(eth_dst=eth_src, vlan_vid=vlan.vid|ofp.OFPVID_PRESENT)
+        group_id = vlan.vid << 16
+        group_id += port.number
+        act = [parser.OFPActionGroup(group_id)]
+        inst = [self.goto_table(self.ACL), self.write_actions(act)]
+
+        of_msgs.append(parser.OFPFlowMod(None, table_id=self.BRIDGING, priority=3,
+                                match=match, instructions=inst,
+                                hard_timeout=learn_timeout))
+        return of_msgs
+
+    def delete_host_from_vlan(self, eth_src, vlan):
+        # OFDPA installs MACs as static that won't move
+        return []
+
+    def delete_all_valve_flows(self):
+        """Delete all flows from all FAUCET tables."""
+        ofmsgs = []
+        for table_id in (self.BRIDGING, self.ACL, self.VLAN, self.TERMINATION_MAC):
+            ofmsgs.append(self.valve_flowdel(table_id))
+        ofmsgs.append(parser.OFPBarrierRequest(None))
+        msg = parser.OFPGroupMod(None, ofp.OFPGC_DELETE, 0,
+                                 ofp.OFPG_ALL)
+        ofmsgs.append(msg)
+        ofmsgs.append(parser.OFPBarrierRequest(None))
+        # TODO: Delete all groups
+        return ofmsgs
+
+    def add_default_flows(self):
+        """Configure datapath with necessary default tables and rules."""
+        ofmsgs = []
+        ofmsgs.extend(self.delete_all_valve_flows())
+        # TODO: Implement these
+        #ofmsgs.extend(self.add_default_drop_flows())
+        #ofmsgs.extend(self.add_vlan_flood_flow())
+        #ofmsgs.extend(self.add_controller_learn_flow())
         return ofmsgs

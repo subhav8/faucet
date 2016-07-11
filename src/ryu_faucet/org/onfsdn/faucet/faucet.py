@@ -182,7 +182,7 @@ class Faucet(app_manager.RyuApp):
             vlan_proto = pkt.get_protocols(vlan.vlan)[0]
             vlan_vid = vlan_proto.vid
         else:
-            return
+            vlan_vid = None
 
         in_port = msg.match['in_port']
         flowmods = self.valve.rcv_packet(dp.id, in_port, vlan_vid, pkt)
